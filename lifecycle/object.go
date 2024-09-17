@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
@@ -23,6 +24,12 @@ type ObjectLifecycle interface {
 	Updated(obj runtime.Object) (runtime.Object, error)
 }
 
+type ObjectLifecycleContext interface {
+	CreateContext(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+	FinalizeContext(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+	UpdatedContext(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+}
+
 type ObjectLifecycleCondition interface {
 	HasCreate() bool
 	HasFinalize() bool
@@ -31,21 +38,69 @@ type ObjectLifecycleCondition interface {
 type objectLifecycleAdapter struct {
 	name          string
 	clusterScoped bool
-	lifecycle     ObjectLifecycle
+	lifecycle     ObjectLifecycleContext
 	objectClient  *objectclient.ObjectClient
+}
+
+var _ ObjectLifecycleContext = (*ObjectLifecycleContextFuncs)(nil)
+
+type ObjectLifecycleContextFuncs struct {
+	CreateContextFunc   func(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+	FinalizeContextFunc func(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+	UpdatedContextFunc  func(ctx context.Context, obj runtime.Object) (runtime.Object, error)
+}
+
+func (o *ObjectLifecycleContextFuncs) CreateContext(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
+	return o.CreateContextFunc(ctx, obj)
+}
+
+func (o *ObjectLifecycleContextFuncs) FinalizeContext(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
+	return o.FinalizeContextFunc(ctx, obj)
+}
+
+func (o *ObjectLifecycleContextFuncs) UpdatedContext(ctx context.Context, obj runtime.Object) (runtime.Object, error) {
+	return o.UpdatedContextFunc(ctx, obj)
+}
+
+func ToContext(lifecycle ObjectLifecycle) ObjectLifecycleContext {
+	return &ObjectLifecycleContextFuncs{
+		CreateContextFunc: func(_ context.Context, obj runtime.Object) (runtime.Object, error) {
+			return lifecycle.Create(obj)
+		},
+		UpdatedContextFunc: func(_ context.Context, obj runtime.Object) (runtime.Object, error) {
+			return lifecycle.Updated(obj)
+		},
+		FinalizeContextFunc: func(_ context.Context, obj runtime.Object) (runtime.Object, error) {
+			return lifecycle.Finalize(obj)
+		},
+	}
 }
 
 func NewObjectLifecycleAdapter(name string, clusterScoped bool, lifecycle ObjectLifecycle, objectClient *objectclient.ObjectClient) func(key string, obj interface{}) (interface{}, error) {
 	o := objectLifecycleAdapter{
 		name:          name,
 		clusterScoped: clusterScoped,
-		lifecycle:     lifecycle,
+		lifecycle:     ToContext(lifecycle),
 		objectClient:  objectClient,
 	}
 	return o.sync
 }
 
+func NewObjectLifecycleAdapterContext(name string, clusterScoped bool, lifecycle ObjectLifecycleContext, objectClient *objectclient.ObjectClient) func(ctx context.Context, key string, obj interface{}) (interface{}, error) {
+	o := objectLifecycleAdapter{
+		name:          name,
+		clusterScoped: clusterScoped,
+		lifecycle:     lifecycle,
+		objectClient:  objectClient,
+	}
+	return o.syncContext
+}
+
 func (o *objectLifecycleAdapter) sync(key string, in interface{}) (interface{}, error) {
+	return o.syncContext(context.Background(), key, in)
+}
+
+func (o *objectLifecycleAdapter) syncContext(ctx context.Context, key string, in interface{}) (interface{}, error) {
 	if in == nil || reflect.ValueOf(in).IsNil() {
 		return nil, nil
 	}
@@ -55,19 +110,19 @@ func (o *objectLifecycleAdapter) sync(key string, in interface{}) (interface{}, 
 		return nil, nil
 	}
 
-	if newObj, cont, err := o.finalize(obj); err != nil || !cont {
+	if newObj, cont, err := o.finalize(ctx, obj); err != nil || !cont {
 		return nil, err
 	} else if newObj != nil {
 		obj = newObj
 	}
 
-	if newObj, cont, err := o.create(obj); err != nil || !cont {
+	if newObj, cont, err := o.create(ctx, obj); err != nil || !cont {
 		return nil, err
 	} else if newObj != nil {
 		obj = newObj
 	}
 
-	return o.record(obj, o.lifecycle.Updated)
+	return o.record(ctx, obj, o.lifecycle.UpdatedContext)
 }
 
 func (o *objectLifecycleAdapter) update(name string, orig, obj runtime.Object) (runtime.Object, error) {
@@ -84,7 +139,7 @@ func (o *objectLifecycleAdapter) update(name string, orig, obj runtime.Object) (
 	return obj, nil
 }
 
-func (o *objectLifecycleAdapter) finalize(obj runtime.Object) (runtime.Object, bool, error) {
+func (o *objectLifecycleAdapter) finalize(ctx context.Context, obj runtime.Object) (runtime.Object, bool, error) {
 	if !o.hasFinalize() {
 		return obj, true, nil
 	}
@@ -103,7 +158,7 @@ func (o *objectLifecycleAdapter) finalize(obj runtime.Object) (runtime.Object, b
 		return nil, false, nil
 	}
 
-	newObj, err := o.record(obj, o.lifecycle.Finalize)
+	newObj, err := o.record(ctx, obj, o.lifecycle.FinalizeContext)
 	if err != nil {
 		return obj, false, err
 	}
@@ -170,7 +225,7 @@ func (o *objectLifecycleAdapter) hasCreate() bool {
 	return !ok || cond.HasCreate()
 }
 
-func (o *objectLifecycleAdapter) record(obj runtime.Object, f func(runtime.Object) (runtime.Object, error)) (runtime.Object, error) {
+func (o *objectLifecycleAdapter) record(ctx context.Context, obj runtime.Object, f func(context.Context, runtime.Object) (runtime.Object, error)) (runtime.Object, error) {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
 		return obj, err
@@ -178,7 +233,7 @@ func (o *objectLifecycleAdapter) record(obj runtime.Object, f func(runtime.Objec
 
 	origObj := obj
 	obj = origObj.DeepCopyObject()
-	if newObj, err := checkNil(obj, f); err != nil {
+	if newObj, err := checkNil(ctx, obj, f); err != nil {
 		newObj, _ = o.update(metadata.GetName(), origObj, newObj)
 		return newObj, err
 	} else if newObj != nil {
@@ -187,15 +242,15 @@ func (o *objectLifecycleAdapter) record(obj runtime.Object, f func(runtime.Objec
 	return obj, nil
 }
 
-func checkNil(obj runtime.Object, f func(runtime.Object) (runtime.Object, error)) (runtime.Object, error) {
-	obj, err := f(obj)
+func checkNil(ctx context.Context, obj runtime.Object, f func(context.Context, runtime.Object) (runtime.Object, error)) (runtime.Object, error) {
+	obj, err := f(ctx, obj)
 	if obj == nil || reflect.ValueOf(obj).IsNil() {
 		return nil, err
 	}
 	return obj, err
 }
 
-func (o *objectLifecycleAdapter) create(obj runtime.Object) (runtime.Object, bool, error) {
+func (o *objectLifecycleAdapter) create(ctx context.Context, obj runtime.Object) (runtime.Object, bool, error) {
 	metadata, err := meta.Accessor(obj)
 	if err != nil {
 		return obj, false, err
@@ -216,7 +271,7 @@ func (o *objectLifecycleAdapter) create(obj runtime.Object) (runtime.Object, boo
 		return obj, true, err
 	}
 
-	obj, err = o.record(obj, o.lifecycle.Create)
+	obj, err = o.record(ctx, obj, o.lifecycle.CreateContext)
 	if err != nil {
 		return obj, false, err
 	}
