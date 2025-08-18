@@ -103,6 +103,7 @@ func (f *Factory) CreateCRDs(ctx context.Context, storageContext types.StorageCo
 	if err != nil {
 		return nil, err
 	}
+	logrus.Infof("Ready: %v", ready)
 
 	for _, schema := range schemas {
 		crd, err := f.createCRD(ctx, apiClient, schema, ready)
@@ -116,6 +117,7 @@ func (f *Factory) CreateCRDs(ctx context.Context, storageContext types.StorageCo
 	if err != nil {
 		return nil, err
 	}
+	logrus.Infof("Ready again: %v", ready)
 
 	for schema, crd := range schemaStatus {
 		if readyCrd, ok := ready[crd.Name]; ok {
@@ -141,11 +143,13 @@ func (f *Factory) waitCRD(ctx context.Context, apiClient clientset.Interface, cr
 		}
 		first = false
 
+		logrus.Infof("Getting CRD %s", crdName)
 		crd, err := apiClient.ApiextensionsV1().CustomResourceDefinitions().Get(ctx, crdName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 
+		logrus.Infof("Conditions %s: %v", crdName, crd.Status.Conditions)
 		for _, cond := range crd.Status.Conditions {
 			switch cond.Type {
 			case apiext.Established:
@@ -170,6 +174,7 @@ func (f *Factory) createCRD(ctx context.Context, apiClient clientset.Interface, 
 
 	crd, ok := ready[name]
 	if ok {
+		logrus.Infof("Skipping already existing: %s", name)
 		return crd, nil
 	}
 
